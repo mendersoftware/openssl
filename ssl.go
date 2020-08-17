@@ -178,6 +178,8 @@ func sni_cb_thunk(p unsafe.Pointer, con *C.SSL, ad unsafe.Pointer, arg unsafe.Po
 
 	s := &SSL{ssl: con}
 	// This attaches a pointer to our SSL struct into the SNI callback.
+	//TODO: go vet complains here:
+	//183:42: possibly passing Go type with embedded pointer to C
 	C.SSL_set_ex_data(s.ssl, get_ssl_idx(), unsafe.Pointer(s))
 
 	// Note: this is ctx.sni_cb, not C.sni_cb
