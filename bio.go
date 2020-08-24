@@ -1,59 +1,97 @@
-// Copyright (C) 2017. See AUTHORS.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package openssl
 
-// #include "shim.h"
+// #include <shim.h>
 import "C"
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"reflect"
+	"runtime"
 	"sync"
 	"unsafe"
 )
 
-const (
-	SSLRecordSize = 16 * 1024
-)
+const SSLRecordSize = 16 * 1024
 
-func nonCopyGoBytes(ptr uintptr, length int) []byte {
-	var slice []byte
-	header := (*reflect.SliceHeader)(unsafe.Pointer(&slice))
-	header.Cap = length
-	header.Len = length
-	header.Data = ptr
-	return slice
+func goBytes(p unsafe.Pointer, size int) []byte {
+	var ret []byte
+	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&ret))
+	hdr.Cap = size
+	hdr.Len = size
+	hdr.Data = uintptr(p)
+	return ret
 }
 
-func nonCopyCString(data *C.char, size C.int) []byte {
-	return nonCopyGoBytes(uintptr(unsafe.Pointer(data)), int(size))
+// newWriteBIO creates a new internal IO interface (BIO) with openssl for
+// writing across the Go/cgo boundary.
+// NOTE: As a finalizer, the pointer no longer becomes reachable from C's write
+// interface, but is NOT freed either. The reason being that the BIO is usually
+// owned by an SSL structure immedeately after initializing a new bio.
+type goBIO struct {
+	bio *C.BIO
+	buf bytes.Buffer
+	mtx sync.RWMutex
+	eof bool
 }
 
-var writeBioMapping = newMapping()
-
-type writeBio struct {
-	data_mtx        sync.Mutex
-	op_mtx          sync.Mutex
-	buf             []byte
-	release_buffers bool
+func newGoBIO() *goBIO {
+	ret := &goBIO{
+		buf: bytes.Buffer{},
+	}
+	bio := C.X_BIO_new_go_bio()
+	if bio == nil {
+		return nil
+	}
+	C.X_BIO_set_data(bio, unsafe.Pointer(ret))
+	ret.bio = bio
+	runtime.SetFinalizer(ret, func(r *goBIO) {
+		C.BIO_free_all(r.bio)
+	})
+	return ret
 }
 
-func loadWritePtr(b *C.BIO) *writeBio {
-	t := token(C.X_BIO_get_data(b))
-	return (*writeBio)(writeBioMapping.Get(t))
+func (b *goBIO) WriteTo(w io.Writer) (n int64, err error) {
+	b.mtx.RLock()
+	defer b.mtx.RUnlock()
+	return b.buf.WriteTo(w)
+}
+
+// ReadFromConn copies bytes from r into the bio buffer until
+// an incomplete read is made, which indicates that the next
+// read from a net.Conn will be blocking.
+func (b *goBIO) ReadFromConn(r io.Reader) (n int, err error) {
+	buf := make([]byte, SSLRecordSize)
+
+	b.mtx.Lock()
+	defer b.mtx.Unlock()
+	L := len(buf)
+	N := 0
+	for {
+		n, err = r.Read(buf)
+		N += n
+		if err != nil {
+			return N, err
+		}
+		_, err = b.buf.Write(buf[:n])
+		if err != nil || n < L {
+			break
+		}
+	}
+
+	return N, err
+}
+
+func (rb *goBIO) MarkEOF() {
+	rb.mtx.Lock()
+	defer rb.mtx.Unlock()
+	rb.eof = true
+}
+
+func loadGoBIO(b *C.BIO) *goBIO {
+	wb := unsafe.Pointer(C.X_BIO_get_data(b))
+	return (*goBIO)(wb)
 }
 
 func bioClearRetryFlags(b *C.BIO) {
@@ -64,213 +102,89 @@ func bioSetRetryRead(b *C.BIO) {
 	C.X_BIO_set_flags(b, C.BIO_FLAGS_READ|C.BIO_FLAGS_SHOULD_RETRY)
 }
 
-//export go_write_bio_write
-func go_write_bio_write(b *C.BIO, data *C.char, size C.int) (rc C.int) {
+//export go_bio_ctrl
+func go_bio_ctrl(
+	b *C.BIO,
+	cmd C.int,
+	larg C.long,
+	parg unsafe.Pointer,
+) (rc C.long) {
 	defer func() {
-		if err := recover(); err != nil {
+		if r := recover(); r != nil {
 			rc = -1
 		}
 	}()
-	ptr := loadWritePtr(b)
-	if ptr == nil || data == nil || size < 0 {
+	bio := loadGoBIO(b)
+	if bio == nil {
 		return -1
 	}
-	ptr.data_mtx.Lock()
-	defer ptr.data_mtx.Unlock()
-	bioClearRetryFlags(b)
-	ptr.buf = append(ptr.buf, nonCopyCString(data, size)...)
-	return size
-}
-
-//export go_write_bio_ctrl
-func go_write_bio_ctrl(b *C.BIO, cmd C.int, arg1 C.long, arg2 unsafe.Pointer) (
-	rc C.long) {
-	defer func() {
-		if err := recover(); err != nil {
-			rc = -1
-		}
-	}()
 	switch cmd {
-	case C.BIO_CTRL_WPENDING:
-		return writeBioPending(b)
+	case C.BIO_CTRL_WPENDING, C.BIO_CTRL_PENDING:
+		bio.mtx.RLock()
+		ret := bio.buf.Len()
+		bio.mtx.RUnlock()
+		return C.long(ret)
 	case C.BIO_CTRL_DUP, C.BIO_CTRL_FLUSH:
 		return 1
-	default:
+	case C.BIO_CTRL_RESET:
+		bio.mtx.Lock()
+		bio.buf.Reset()
+		bio.mtx.Unlock()
+		return 1
+	case C.BIO_CTRL_EOF:
+		if bio.eof {
+			return 1
+		}
+	}
+	return 0
+}
+
+//export go_bio_read
+func go_bio_read(b *C.BIO, p *C.char, size C.int) (rc C.int) {
+	if p == nil || size <= 0 {
 		return 0
 	}
-}
-
-func writeBioPending(b *C.BIO) C.long {
-	ptr := loadWritePtr(b)
-	if ptr == nil {
-		return 0
-	}
-	ptr.data_mtx.Lock()
-	defer ptr.data_mtx.Unlock()
-	return C.long(len(ptr.buf))
-}
-
-func (b *writeBio) WriteTo(w io.Writer) (rv int64, err error) {
-	b.op_mtx.Lock()
-	defer b.op_mtx.Unlock()
-
-	// write whatever data we currently have
-	b.data_mtx.Lock()
-	data := b.buf
-	b.data_mtx.Unlock()
-
-	if len(data) == 0 {
-		return 0, nil
-	}
-	n, err := w.Write(data)
-
-	// subtract however much data we wrote from the buffer
-	b.data_mtx.Lock()
-	b.buf = b.buf[:copy(b.buf, b.buf[n:])]
-	if b.release_buffers && len(b.buf) == 0 {
-		b.buf = nil
-	}
-	b.data_mtx.Unlock()
-
-	return int64(n), err
-}
-
-func (self *writeBio) Disconnect(b *C.BIO) {
-	if loadWritePtr(b) == self {
-		writeBioMapping.Del(token(C.X_BIO_get_data(b)))
-		C.X_BIO_set_data(b, nil)
-	}
-}
-
-func (b *writeBio) MakeCBIO() *C.BIO {
-	rv := C.X_BIO_new_write_bio()
-	token := writeBioMapping.Add(unsafe.Pointer(b))
-	C.X_BIO_set_data(rv, unsafe.Pointer(token))
-	return rv
-}
-
-var readBioMapping = newMapping()
-
-type readBio struct {
-	data_mtx        sync.Mutex
-	op_mtx          sync.Mutex
-	buf             []byte
-	eof             bool
-	release_buffers bool
-}
-
-func loadReadPtr(b *C.BIO) *readBio {
-	return (*readBio)(readBioMapping.Get(token(C.X_BIO_get_data(b))))
-}
-
-//export go_read_bio_read
-func go_read_bio_read(b *C.BIO, data *C.char, size C.int) (rc C.int) {
 	defer func() {
-		if err := recover(); err != nil {
+		if r := recover(); r != nil {
 			rc = -1
 		}
 	}()
-	ptr := loadReadPtr(b)
-	if ptr == nil || size < 0 {
-		return -1
-	}
-	ptr.data_mtx.Lock()
-	defer ptr.data_mtx.Unlock()
+	rb := loadGoBIO(b)
+	rb.mtx.RLock()
+	defer rb.mtx.RUnlock()
 	bioClearRetryFlags(b)
-	if len(ptr.buf) == 0 {
-		if ptr.eof {
+	buf := goBytes(unsafe.Pointer(p), int(size))
+	n, err := rb.buf.Read(buf)
+	if err != nil {
+		if err == io.EOF && rb.eof {
 			return 0
 		}
 		bioSetRetryRead(b)
 		return -1
 	}
-	if size == 0 || data == nil {
-		return C.int(len(ptr.buf))
-	}
-	n := copy(nonCopyCString(data, size), ptr.buf)
-	ptr.buf = ptr.buf[:copy(ptr.buf, ptr.buf[n:])]
-	if ptr.release_buffers && len(ptr.buf) == 0 {
-		ptr.buf = nil
-	}
 	return C.int(n)
 }
 
-//export go_read_bio_ctrl
-func go_read_bio_ctrl(b *C.BIO, cmd C.int, arg1 C.long, arg2 unsafe.Pointer) (
-	rc C.long) {
-
+//export go_bio_write
+func go_bio_write(b *C.BIO, data *C.char, size C.int) (rc C.int) {
+	if data == nil || size == 0 {
+		return 0
+	}
 	defer func() {
-		if err := recover(); err != nil {
+		if r := recover(); r != nil {
 			rc = -1
 		}
 	}()
-	switch cmd {
-	case C.BIO_CTRL_PENDING:
-		return readBioPending(b)
-	case C.BIO_CTRL_DUP, C.BIO_CTRL_FLUSH:
-		return 1
-	default:
-		return 0
+	wb := loadGoBIO(b)
+	wb.mtx.Lock()
+	defer wb.mtx.Unlock()
+	bioClearRetryFlags(b)
+	buf := goBytes(unsafe.Pointer(data), int(size))
+	n, err := wb.buf.Write(buf)
+	if err != nil {
+		return -1
 	}
-}
-
-func readBioPending(b *C.BIO) C.long {
-	ptr := loadReadPtr(b)
-	if ptr == nil {
-		return 0
-	}
-	ptr.data_mtx.Lock()
-	defer ptr.data_mtx.Unlock()
-	return C.long(len(ptr.buf))
-}
-
-func (b *readBio) ReadFromOnce(r io.Reader) (n int, err error) {
-	b.op_mtx.Lock()
-	defer b.op_mtx.Unlock()
-
-	// make sure we have a destination that fits at least one SSL record
-	b.data_mtx.Lock()
-	if cap(b.buf) < len(b.buf)+SSLRecordSize {
-		new_buf := make([]byte, len(b.buf), len(b.buf)+SSLRecordSize)
-		copy(new_buf, b.buf)
-		b.buf = new_buf
-	}
-	dst := b.buf[len(b.buf):cap(b.buf)]
-	dst_slice := b.buf
-	b.data_mtx.Unlock()
-
-	n, err = r.Read(dst)
-	b.data_mtx.Lock()
-	defer b.data_mtx.Unlock()
-	if n > 0 {
-		if len(dst_slice) != len(b.buf) {
-			// someone shrunk the buffer, so we read in too far ahead and we
-			// need to slide backwards
-			copy(b.buf[len(b.buf):len(b.buf)+n], dst)
-		}
-		b.buf = b.buf[:len(b.buf)+n]
-	}
-	return n, err
-}
-
-func (b *readBio) MakeCBIO() *C.BIO {
-	rv := C.X_BIO_new_read_bio()
-	token := readBioMapping.Add(unsafe.Pointer(b))
-	C.X_BIO_set_data(rv, unsafe.Pointer(token))
-	return rv
-}
-
-func (self *readBio) Disconnect(b *C.BIO) {
-	if loadReadPtr(b) == self {
-		readBioMapping.Del(token(C.X_BIO_get_data(b)))
-		C.X_BIO_set_data(b, nil)
-	}
-}
-
-func (b *readBio) MarkEOF() {
-	b.data_mtx.Lock()
-	defer b.data_mtx.Unlock()
-	b.eof = true
+	return C.int(n)
 }
 
 type anyBio C.BIO

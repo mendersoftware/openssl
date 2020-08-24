@@ -42,8 +42,8 @@ type Conn struct {
 
 	conn             net.Conn
 	ctx              *Ctx // for gc
-	into_ssl         *readBio
-	from_ssl         *writeBio
+	into_ssl         *goBIO
+	from_ssl         *goBIO
 	is_shutdown      bool
 	mtx              sync.Mutex
 	want_read_future *utils.Future
@@ -131,64 +131,38 @@ const (
 	UnsupportedNameSyntax           VerifyResult = C.X509_V_ERR_UNSUPPORTED_NAME_SYNTAX
 )
 
-func newSSL(ctx *C.SSL_CTX) (*C.SSL, error) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	ssl := C.SSL_new(ctx)
-	if ssl == nil {
-		return nil, errorFromErrorQueue()
-	}
-	return ssl, nil
-}
-
 func newConn(conn net.Conn, ctx *Ctx) (*Conn, error) {
 	ssl, err := newSSL(ctx.ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	into_ssl := &readBio{}
-	from_ssl := &writeBio{}
+	into_ssl := newGoBIO()
+	from_ssl := newGoBIO()
 
-	if ctx.GetMode()&ReleaseBuffers > 0 {
-		into_ssl.release_buffers = true
-		from_ssl.release_buffers = true
-	}
-
-	into_ssl_cbio := into_ssl.MakeCBIO()
-	from_ssl_cbio := from_ssl.MakeCBIO()
-	if into_ssl_cbio == nil || from_ssl_cbio == nil {
-		// these frees are null safe
-		// FIXME: memory leak: MakeCBIO maintains a mapping of
-		// *C.BIO types making GC keep the map entry.
-		C.BIO_free(into_ssl_cbio)
-		C.BIO_free(from_ssl_cbio)
-		C.SSL_free(ssl)
+	if into_ssl == nil || from_ssl == nil {
 		return nil, errors.New("failed to allocate memory BIO")
 	}
 
 	// the ssl object takes ownership of these objects now
-	C.SSL_set_bio(ssl, into_ssl_cbio, from_ssl_cbio)
+	C.SSL_set_bio(ssl.ssl, into_ssl.bio, from_ssl.bio)
 
-	s := &SSL{ssl: ssl}
+	runtime.SetFinalizer(into_ssl, nil)
+	runtime.SetFinalizer(from_ssl, nil)
+
 	//go vet complains here:
 	//173:42: possibly passing Go type with embedded pointer to C
-	u := unsafe.Pointer(s)
-	C.SSL_set_ex_data(s.ssl, get_ssl_idx(), u)
+	u := unsafe.Pointer(ssl)
+	C.SSL_set_ex_data(ssl.ssl, get_ssl_idx(), u)
 
 	c := &Conn{
-		SSL: s,
+		SSL: ssl,
 
 		conn:     conn,
 		ctx:      ctx,
 		into_ssl: into_ssl,
-		from_ssl: from_ssl}
-	runtime.SetFinalizer(c, func(c *Conn) {
-		// FIXME: memory leak: C.BIO_free never called
-		c.into_ssl.Disconnect(into_ssl_cbio)
-		c.from_ssl.Disconnect(from_ssl_cbio)
-		C.SSL_free(c.ssl)
-	})
+		from_ssl: from_ssl,
+	}
 	return c, nil
 }
 
@@ -238,17 +212,12 @@ func (c *Conn) CurrentCipher() (string, error) {
 }
 
 func (c *Conn) fillInputBuffer() error {
-	for {
-		n, err := c.into_ssl.ReadFromOnce(c.conn)
-		if n == 0 && err == nil {
-			continue
-		}
-		if err == io.EOF {
-			c.into_ssl.MarkEOF()
-			return c.Close()
-		}
-		return err
+	_, err := c.into_ssl.ReadFromConn(c.conn)
+	if err == io.EOF {
+		c.into_ssl.MarkEOF()
+		return c.Close()
 	}
+	return err
 }
 
 func (c *Conn) flushOutputBuffer() error {
@@ -334,7 +303,7 @@ func (c *Conn) handshake() func() error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	rv, errno := C.SSL_do_handshake(c.ssl)
-	runtime.KeepAlive(c)
+	runtime.KeepAlive(c.ssl)
 	if rv > 0 {
 		return nil
 	}

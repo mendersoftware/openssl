@@ -46,6 +46,21 @@ type SSL struct {
 	verify_cb VerifyCallback
 }
 
+func newSSL(ctx *C.SSL_CTX) (*SSL, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	ssl := &SSL{}
+	ssl.ssl = C.SSL_new(ctx)
+	if ssl.ssl == nil {
+		return nil, errorFromErrorQueue()
+	}
+	runtime.SetFinalizer(ssl, func(s *SSL) {
+		C.SSL_free(s.ssl)
+	})
+	return ssl, nil
+
+}
+
 //export go_ssl_verify_cb_thunk
 func go_ssl_verify_cb_thunk(p unsafe.Pointer, ok C.int, ctx *C.X509_STORE_CTX) C.int {
 	defer func() {
@@ -203,7 +218,7 @@ func sni_cb_thunk(p unsafe.Pointer, con *C.SSL, ad unsafe.Pointer, arg unsafe.Po
 	//go vet complains here:
 	//183:42: possibly passing Go type with embedded pointer to C
 	u := unsafe.Pointer(s)
-	C.SSL_set_ex_data(s.ssl, get_ssl_idx(), u)
+	C.SSL_set_ex_data(con, get_ssl_idx(), u)
 
 	// Note: this is ctx.sni_cb, not C.sni_cb
 	return C.int(sni_cb(s))
