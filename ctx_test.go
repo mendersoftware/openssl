@@ -54,6 +54,9 @@ func TestCtxSetDefaultVerifyLocations(t *testing.T) {
 	}
 
 	conn, err := Dial("tcp", "google.com:443", ctx, 0)
+	if conn == nil || err != nil {
+		t.Skip("can't connect, skipping the test.")
+	}
 	v := conn.VerifyResult()
 
 	if v != UnableToGetIssuerCertLocally {
