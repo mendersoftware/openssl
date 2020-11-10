@@ -69,6 +69,10 @@ int X_EVP_DigestVerify(EVP_MD_CTX *ctx, const unsigned char *sigret,
 	return EVP_DigestVerify(ctx, sigret, siglen, tbs, tbslen);
 }
 
+int X_PEM_write_bio_PrivateKey_traditional(BIO *bio, EVP_PKEY *key, const EVP_CIPHER *enc, unsigned char *kstr, int klen, pem_password_cb *cb, void *u) {
+	return PEM_write_bio_PrivateKey(bio, key, enc, kstr, klen, cb, u);
+}
+
 #else
 
 const int X_ED25519_SUPPORT = 0;
@@ -216,9 +220,11 @@ void X_HMAC_CTX_free(HMAC_CTX *ctx) {
 	HMAC_CTX_free(ctx);
 }
 
+#if OPENSSL_VERSION_NUMBER < 0x1010100fL
 int X_PEM_write_bio_PrivateKey_traditional(BIO *bio, EVP_PKEY *key, const EVP_CIPHER *enc, unsigned char *kstr, int klen, pem_password_cb *cb, void *u) {
 	return PEM_write_bio_PrivateKey_traditional(bio, key, enc, kstr, klen, cb, u);
 }
+#endif
 
 #endif
 
@@ -338,6 +344,7 @@ void X_HMAC_CTX_free(HMAC_CTX *ctx) {
 	}
 }
 
+#if OPENSSL_VERSION_NUMBER < 0x1010100fL
 int X_PEM_write_bio_PrivateKey_traditional(BIO *bio, EVP_PKEY *key, const EVP_CIPHER *enc, unsigned char *kstr, int klen, pem_password_cb *cb, void *u) {
 	/* PEM_write_bio_PrivateKey always tries to use the PKCS8 format if it
 	 * is available, instead of using the "traditional" format as stated in the
@@ -363,6 +370,7 @@ int X_PEM_write_bio_PrivateKey_traditional(BIO *bio, EVP_PKEY *key, const EVP_CI
 	return PEM_ASN1_write_bio((i2d_of_void *)i2d_PrivateKey,
 		pem_type_str, bio, key, enc, kstr, klen, cb, u);
 }
+#endif
 
 #endif
 
