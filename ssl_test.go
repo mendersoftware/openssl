@@ -299,7 +299,7 @@ func ThroughputBenchmark(b *testing.B, constructor func(
 		defer wg.Done()
 		_, err = io.Copy(client, bytes.NewReader([]byte(data)))
 		if err != nil {
-			b.Fatal(err)
+			b.Error(err)
 		}
 	}()
 	go func() {
@@ -308,10 +308,10 @@ func ThroughputBenchmark(b *testing.B, constructor func(
 		buf := &bytes.Buffer{}
 		_, err = io.CopyN(buf, server, int64(len(data)))
 		if err != nil {
-			b.Fatal(err)
+			b.Error(err)
 		}
 		if !bytes.Equal(buf.Bytes(), data) {
-			b.Fatal("mismatched data")
+			b.Error("mismatched data")
 		}
 	}()
 	wg.Wait()
@@ -551,27 +551,27 @@ func LotsOfConns(t *testing.T, payload_size int64, loops, clients int,
 		for {
 			conn, err := ssl_listener.Accept()
 			if err != nil {
-				t.Fatalf("failed accept: %s", err)
+				t.Errorf("failed accept: %s", err)
 				continue
 			}
 			go func() {
 				defer func() {
 					err = conn.Close()
 					if err != nil {
-						t.Fatalf("failed closing: %s", err)
+						t.Errorf("failed closing: %s", err)
 					}
 				}()
 				for i := 0; i < loops; i++ {
 					_, err := io.Copy(ioutil.Discard,
 						io.LimitReader(conn, payload_size))
 					if err != nil {
-						t.Fatalf("failed reading: %s", err)
+						t.Errorf("failed reading: %s", err)
 						return
 					}
 					_, err = io.Copy(conn, io.LimitReader(rand.Reader,
 						payload_size))
 					if err != nil {
-						t.Fatalf("failed writing: %s", err)
+						t.Errorf("failed writing: %s", err)
 						return
 					}
 				}
@@ -595,7 +595,7 @@ func LotsOfConns(t *testing.T, payload_size int64, loops, clients int,
 			defer func() {
 				err = ssl_client.Close()
 				if err != nil {
-					t.Fatalf("failed closing: %s", err)
+					t.Errorf("failed closing: %s", err)
 				}
 				wg.Done()
 			}()
@@ -603,13 +603,13 @@ func LotsOfConns(t *testing.T, payload_size int64, loops, clients int,
 				_, err := io.Copy(ssl_client, io.LimitReader(rand.Reader,
 					payload_size))
 				if err != nil {
-					t.Fatalf("failed writing: %s", err)
+					t.Errorf("failed writing: %s", err)
 					return
 				}
 				_, err = io.Copy(ioutil.Discard,
 					io.LimitReader(ssl_client, payload_size))
 				if err != nil {
-					t.Fatalf("failed reading: %s", err)
+					t.Errorf("failed reading: %s", err)
 					return
 				}
 			}
