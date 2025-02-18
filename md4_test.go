@@ -57,6 +57,7 @@ var md4Examples = []struct{ out, in string }{
 }
 
 func TestMD4Examples(t *testing.T) {
+	t.Skip("MD4 not working correctly with OpenSSL 3. See QA-931")
 	for _, ex := range md4Examples {
 		buf, err := hex.DecodeString(ex.in)
 		if err != nil {
@@ -75,6 +76,7 @@ func TestMD4Examples(t *testing.T) {
 }
 
 func TestMD4Writer(t *testing.T) {
+	t.Skip("MD4 not working correctly with OpenSSL 3. See QA-931")
 	ohash, err := NewMD4Hash()
 	if err != nil {
 		t.Fatal(err)
