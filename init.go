@@ -92,7 +92,6 @@ package openssl
 import "C"
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 )
@@ -117,5 +116,5 @@ func errorFromErrorQueue() error {
 			C.GoString(C.ERR_func_error_string(err)),
 			C.GoString(C.ERR_reason_error_string(err))))
 	}
-	return errors.New(fmt.Sprintf("SSL errors: %s", strings.Join(errs, "\n")))
+	return fmt.Errorf("SSL errors: %s", strings.Join(errs, "\n"))
 }

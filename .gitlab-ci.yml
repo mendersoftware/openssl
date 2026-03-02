@@ -3,7 +3,7 @@ include:
     file:
       - '.gitlab-ci-github-status-updates.yml'
       - '.gitlab-ci-check-commits-signoffs.yml'
-      - '.gitlab-ci-check-golang-static.yml'
+      - '.gitlab-ci-check-golang-lint.yml'
 
 stages:
   - test
